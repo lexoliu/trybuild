@@ -5,7 +5,9 @@ mod tests;
 use self::Normalization::*;
 use crate::directory::Directory;
 use crate::run::PathDependency;
+use serde_derive::Deserialize;
 use std::cmp;
+use std::fs;
 use std::mem;
 use std::path::Path;
 
@@ -66,6 +68,7 @@ normalizations! {
     UnindentSuggestion,
     CustomRegistry,
     MorePathDependencies,
+    CargoGit,
     // New normalization steps are to be inserted here at the end so that any
     // snapshots saved before your normalization change remain passing.
 }
@@ -337,6 +340,11 @@ impl<'a> Filter<'a> {
                     }
                 }
             }
+            if self.normalization >= CargoGit && !other_crate {
+                // --> /home/.cargo/git/checkouts/nami-3b7bff5da959545f/8217e30/core/src/id.rs:91:1
+                // --> $CARGO/nami-core-$VERSION/src/id.rs:91:1
+                other_crate = normalize_cargo_git(&mut line, indent);
+            }
             if other_crate && self.normalization >= WorkspaceLines {
                 // Blank out line numbers for this particular error since rustc
                 // tends to reach into code from outside of the test case. The
@@ -508,6 +516,76 @@ fn normalize_cargo_registry(
     let hash_end = pos + prefix.len() + slash;
     line.replace_range(indent + 4..hash_end, "$CARGO");
     true
+}
+
+// Matches a cargo git checkout source path of the form:
+//   .../git/checkouts/{name}-{16-hex-chars}/{revision}/{package path}/...
+// and replaces the prefix up to and including the package directory with
+// `$CARGO/{package name}-$VERSION`, the form a registry source of the same
+// package normalizes to, so a snapshot does not change when a git dependency
+// is swapped for a release. A checkout holds a whole repository, so the
+// package is the one whose manifest is nearest to the file.
+// Returns true if a substitution was made.
+fn normalize_cargo_git(line: &mut String, indent: usize) -> bool {
+    let path_start = indent + 4;
+    let prefix = "/git/checkouts/";
+    let Some(pos) = line.find(prefix) else {
+        return false;
+    };
+    if pos < path_start {
+        return false;
+    }
+    let rest = &line[pos + prefix.len()..];
+    let Some(slash) = rest.find('/') else {
+        return false;
+    };
+    let Some((_, hash)) = rest[..slash].rsplit_once('-') else {
+        return false;
+    };
+    if !(hash.len() == 16 && is_ascii_lowercase_hex(hash)) {
+        return false;
+    }
+    let after_hash = &rest[slash + 1..];
+    let Some(revision_len) = after_hash.find('/') else {
+        return false;
+    };
+    if revision_len == 0 || !is_ascii_lowercase_hex(&after_hash[..revision_len]) {
+        return false;
+    }
+    let checkout_end = pos + prefix.len() + slash + 1 + revision_len;
+
+    let mut path = line[path_start..].to_owned();
+    hide_trailing_numbers(&mut path);
+    let checkout = Path::new(&line[path_start..checkout_end]);
+    let Some((package_dir, name)) = Path::new(&path)
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(checkout))
+        .find_map(|dir| package_name(dir).map(|name| (dir, name)))
+    else {
+        return false;
+    };
+    let package_dir_len = package_dir.as_os_str().len();
+    let replacement = format!("$CARGO/{}-$VERSION", name);
+    line.replace_range(path_start..path_start + package_dir_len, &replacement);
+    true
+}
+
+// The name of the package whose manifest is in `dir`, if there is one.
+fn package_name(dir: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Manifest {
+        package: Option<Package>,
+    }
+
+    #[derive(Deserialize)]
+    struct Package {
+        name: String,
+    }
+
+    let manifest = fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let manifest: Manifest = toml::from_str(&manifest).ok()?;
+    Some(manifest.package?.name)
 }
 
 // "10 | T: Send,"  ->  "   | T: Send,"
